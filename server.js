@@ -233,9 +233,13 @@ app.get('/api/admin/requests', requireSuper, async (req, res) => {
   try { const { data, error } = await db.from('admins').select('*').eq('status', 'pending').order('created_at', { ascending: false }); if (error) throw error; res.json({ requests: (data || []).map(publicAdmin) }); }
   catch (e) { res.status(500).json({ error: errText(e) }); }
 });
-app.patch('/api/admin/requests/:id', requireSuper, async (req, res) => {
+app.('/api/admin/requests/:id', requireSuper, async (req, res) => {
   try {
     if (!['approved', 'denied'].includes(req.body.status)) return res.status(400).json({ error: 'Invalid status' });
+<<<<<<< HEAD
+    if (req.body.status === 'approved' && (await subAdminCount()) >= MAX_SUB_ADMINS) return res.status(400).json({ error: `Only ${MAX_SUB_ADMINS} sub admins are allowed. Remove one in Settings first.` });
+=======
+>>>>>>> origin/main
     const { data, error } = await db.from('admins').update({ status: req.body.status }).eq('id', req.params.id).eq('status', 'pending').select('id').maybeSingle();
     if (error) throw error; if (!data) return res.status(404).json({ error: 'Request not found' });
     await logActivity('admin', req.session.admin.id, `admin_request_${req.body.status}`, null, { adminId: req.params.id });
@@ -380,6 +384,70 @@ app.patch('/api/admin/admins/:id', requireSuper, async (req, res) => {
   } catch (e) { res.status(500).json({ error: errText(e) }); }
 });
 
+<<<<<<< HEAD
+// ---------- Sub admins (max 2, added by the main admin in Settings) ----------
+const MAX_SUB_ADMINS = 2;
+async function subAdminCount() {
+  const { count, error } = await db.from('admins').select('*', { count: 'exact', head: true }).eq('role', 'admin').eq('status', 'approved');
+  if (error) throw error; return count || 0;
+}
+app.post('/api/admin/sub-admins', requireSuper, async (req, res) => {
+  try {
+    const name = String(req.body.name || '').trim(), username = String(req.body.username || '').trim(), password = String(req.body.password || ''), email = String(req.body.email || '').trim();
+    if (!name) return res.status(400).json({ error: 'Enter the sub admin name' });
+    if (!USERNAME_RE.test(username)) return res.status(400).json({ error: 'Username must be 3-30 characters: letters, numbers, dot or hyphen' });
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    if ((await subAdminCount()) >= MAX_SUB_ADMINS) return res.status(400).json({ error: `Only ${MAX_SUB_ADMINS} sub admins are allowed. Remove one first.` });
+    if (await usernameTaken(username, null)) return res.status(400).json({ error: 'That username is already taken' });
+    const a = { id: id('admin'), username, name, email, pass_hash: await bcrypt.hash(password, 12), role: 'admin', status: 'approved', created_at: new Date().toISOString() };
+    const { error } = await db.from('admins').insert(a); if (error) throw error;
+    await logActivity('admin', req.session.admin.id, 'sub_admin_added', null, { adminId: a.id, username });
+    res.json({ admin: publicAdmin(a) });
+  } catch (e) { res.status(500).json({ error: errText(e) }); }
+});
+app.delete('/api/admin/sub-admins/:id', requireSuper, async (req, res) => {
+  try {
+    const { data: t, error: e0 } = await db.from('admins').select('id,role,username').eq('id', req.params.id).maybeSingle();
+    if (e0) throw e0;
+    if (!t || t.role !== 'admin') return res.status(404).json({ error: 'Sub admin not found' });
+    await db.from('settings').delete().eq('key', LINK_PREFIX + t.id); // drop any linked member of this admin
+    const { error } = await db.from('admins').delete().eq('id', t.id); if (error) throw error;
+    await logActivity('admin', req.session.admin.id, 'sub_admin_removed', null, { username: t.username });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: errText(e) }); }
+});
+
+// ---------- Main admin access (password protected, main admin only) ----------
+const MAIN_ACCESS_MS = 10 * 60 * 1000;
+const mainAccessLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, skipSuccessfulRequests: true, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many wrong passwords. Try again in 15 minutes.' } });
+function requireMainAccess(req, res, next) {
+  if (!req.session.admin || req.session.admin.role !== 'super') return res.status(403).json({ error: 'Main admin access only' });
+  if (!req.session.mainAccessUntil || req.session.mainAccessUntil < Date.now()) return res.status(403).json({ error: 'Enter the main admin password', locked: true });
+  next();
+}
+app.post('/api/admin/main-access', requireSuper, mainAccessLimiter, async (req, res) => {
+  try {
+    const { data: me, error } = await db.from('admins').select('pass_hash').eq('id', req.session.admin.id).maybeSingle();
+    if (error) throw error;
+    if (!me || !(await bcrypt.compare(String(req.body.password || ''), me.pass_hash))) return res.status(401).json({ error: 'Incorrect password' });
+    req.session.mainAccessUntil = Date.now() + MAIN_ACCESS_MS;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: errText(e) }); }
+});
+app.post('/api/admin/main-access/lock', requireAdmin, (req, res) => { delete req.session.mainAccessUntil; res.json({ ok: true }); });
+app.get('/api/admin/main-access/log', requireMainAccess, async (req, res) => {
+  try {
+    const okDate = v => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ''));
+    const to = okDate(req.query.to) ? String(req.query.to) : ymd();
+    const from = okDate(req.query.from) ? String(req.query.from) : ymd(new Date(Date.now() - 6 * 86400000));
+    let rows = await fetchAll(() => db.from('attendance').select('date,check_in,check_out,counted,members(name,eid,dept)').gte('date', from).lte('date', to).order('date', { ascending: false }).order('id'));
+    if (rows.length > 20000) rows = rows.slice(0, 20000);
+    res.json({ from, to, rows: rows.map(r => ({ date: r.date, checkIn: r.check_in, checkOut: r.check_out, counted: r.counted !== false, name: r.members?.name || '', eid: r.members?.eid || '', dept: r.members?.dept || '' })) });
+  } catch (e) { res.status(500).json({ error: errText(e) }); }
+});
+
+=======
+>>>>>>> origin/main
 const workerLoginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, skipSuccessfulRequests: true, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many failed attempts. Please try again in 15 minutes.' } });
 app.post('/api/worker/auth', workerLoginLimiter, async (req, res) => {
   try {
